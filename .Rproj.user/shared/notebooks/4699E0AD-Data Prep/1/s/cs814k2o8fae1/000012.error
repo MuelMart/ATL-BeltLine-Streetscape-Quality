@@ -1,0 +1,1 @@
+{"frames":[{"func":"street_segments %>% st_join(ap %>% st_buffer(buffer), st_intersects) %>% \n    sf_poly2line()","file":"","line_number":0,"end_line_number":0,"character_number":0,"end_character_number":0}],"message":"Error in sf_poly2line(.) : could not find function \"sf_poly2line\"\n"}

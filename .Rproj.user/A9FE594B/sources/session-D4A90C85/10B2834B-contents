@@ -1,0 +1,478 @@
+<style type="text/css">
+  body{
+  font-family: Arial;
+  }
+</style>
+
+# Introduction to the assignment
+
+### This assignment consists of three main sections.
+
+**In the first section**, you need to select one Census Tract that you think is the most walkable and another one that you think is least walkable within Fulton and DeKalb Counties, GA. As long as the two Census Tracts are within the two counties, you can pick any two you want. If the area you want to use as walkable/unwalkable area is not well-covered by one Census Tract, you can select multiple tracts (e.g., selecting three adjacent tracts as one walkable area). The definition of 'walkable' can be your own - you can choose solely based on your experience (e.g., had best/worst walking experience), refer to Walk Score, or any other mix of criteria you want. After you make the selection, provide a short write-up of why you chose those Census Tracts. 
+
+**The second section** is the main part of this assignment in which you prepare OSM data, download GSV images, apply computer vision. 
+
+**In the third section**, you will summarise and analyze the output and provide your findings. After you apply computer vision to the images, you will have the number of pixels in each image that represent 150 categories in your data. You will focus on the following categories in your analysis: **building, sky, tree, road, and sidewalk**. Specifically, you will (1) create maps to visualize the spatial distribution of different objects, (2) compare the mean of each category between the two Census Tract and (3) draw boxplots to compare the distributions. 
+
+```{r, message=FALSE, warning=FALSE}
+library(tidyverse)
+library(tidycensus)
+library(osmdata)
+library(sfnetworks)
+library(units)
+library(sf)
+library(tidygraph)
+library(tmap)
+library(here)
+library(kableExtra)
+```
+
+# Section 1. Choose your Census Tracts.
+
+Provide a brief description of your census tracts. Why do you think the Census Tracts are walkable and unwalkable? What were the contributing factors? 
+
+* I am using % of car commuters to determine which tracts are most and least walkable
+```{r}
+epsg_id = 26967 
+
+#I think the best variables to use for asessing Census Tract walkability is the % of people who commute via car.
+var_list <- load_variables(2020, 'acs5')
+variables <- c(
+  'Car Commute' = 'B08301_002',
+  'Population' = 'B01003_001'
+)
+
+commute_raw <- get_acs('tract', 
+                   variables = variables, state = 'GA', 
+                   county = c('DeKalb County', 'Fulton County'),
+                   output = 'wide',
+                   geometry = TRUE,
+                   key = Sys.getenv('census_api')
+                   ) %>%
+  mutate('% Car Commute' = `Car CommuteE` / `PopulationE`) %>%
+  st_transform(crs = epsg_id) %>%
+  arrange(-`% Car Commute`)
+
+
+tmap_mode('view')
+tm_shape(commute_raw) +
+  tm_polygons(col = '% Car Commute')
+
+commute_raw %>%
+  head(5) %>%
+  st_drop_geometry() %>%
+  knitr::kable('html', caption = 'Tracts with Highest Proportion of Car Commuters')
+
+commute_raw %>%
+  tail(5)  %>%
+  st_drop_geometry() %>%
+  knitr::kable('html', caption = 'Tracts with Lowest Proportion of Car Commuters')
+```
+
+Based on the results from above, I would contend that Tract 94.07 and Tract 38 in Fulton County are the least and most walkable tracts respectively.
+
+# Section 2. OSM, GSV, and computer vision.
+
+Fill out the template to complete the script.
+
+### Step 1. Get OSM data and clean it.
+
+The `getbb()` function, which we used in the class material to download OSM data, isn't suitable for downloading just two Census Tracts. We will instead use an alternative method. 
+
+(1) Using tidycensus package, download the Census Tract polygon for Fulton and DeKalb counties.
+(2) Extract two Census Tracts, each of which will be your most walkable and least walkable Census Tracts.
+(3) Using their bounding boxes, get OSM data.
+(4) Convert them into sfnetworks data and clean it.
+
+```{r}
+# TASK ////////////////////////////////////////////////////////////////////////
+# 1. Set up your api key here
+census_api_key(Sys.getenv("census_api"))
+# //TASK //////////////////////////////////////////////////////////////////////
+
+
+
+# =========== NO MODIFICATION ZONE STARTS HERE ===============================
+# Download Census Tract polygon for Fulton and DeKalb
+tract <- get_acs("tract", 
+                 variables = c('tot_pop' = 'B01001_001'),
+                 year = 2020, 
+                 state = "GA", 
+                 county = c("Fulton", "DeKalb"), 
+                 geometry = TRUE)
+# =========== NO MODIFY ZONE ENDS HERE ========================================
+
+
+
+# TASK ////////////////////////////////////////////////////////////////////////
+# The purpose of this TASK is to create one bounding box for walkable Census Tract and another bounding box for unwalkable Census Tract.
+# As long as you generate what's needed for the subsequent codes, you are good. The numbered list of tasks below is to provide some hints.
+# 1. Write the GEOID of walkable & unwalkable Census Tracts. e.g., tr1_ID <- c("13121001205", "13121001206")
+# 2. Extract the selected Census Tracts using tr1_ID & tr2_ID
+# 3. Create their bounding boxes using st_bbox(), and 
+# 4. assign them to tract_1_bb and tract_1_bb, respectively.
+
+# For the walkable Census Tract(s)
+# 1. 
+tr1_ID <- '13121003800'
+
+# 2~4
+tract_1_bb <- tract %>% 
+  filter(GEOID == tr1_ID) %>%
+  st_bbox()
+
+# For the unwalkable Census Tract(s)  
+# 1.
+tr2_ID <- '13121009407'
+
+# 2~4
+tract_2_bb <- tract %>% 
+  filter(GEOID == tr2_ID) %>%
+  st_bbox()
+# //TASK //////////////////////////////////////////////////////////////////////
+
+  
+  
+# =========== NO MODIFICATION ZONE STARTS HERE ===============================
+# Get OSM data for the two bounding box
+osm_1 <- opq(bbox = tract_1_bb) %>%
+  add_osm_feature(key = 'highway', 
+                  value = c("motorway", "trunk", "primary", 
+                            "secondary", "tertiary", "unclassified",
+                            "residential")) %>%
+  osmdata_sf() %>% 
+  osm_poly2line()
+
+osm_2 <- opq(bbox = tract_2_bb) %>%
+  add_osm_feature(key = 'highway', 
+                  value = c("motorway", "trunk", "primary", 
+                            "secondary", "tertiary", "unclassified",
+                            "residential")) %>%
+  osmdata_sf() %>% 
+  osm_poly2line()
+# =========== NO MODIFY ZONE ENDS HERE ========================================
+
+
+
+# TASK ////////////////////////////////////////////////////////////////////////
+# 1. Convert osm_1 and osm_2 to sfnetworks objects (set directed = FALSE)
+# 2. Clean the network by (1) deleting parallel lines and loops, (2) create missing nodes, and (3) remove pseudo nodes, 
+# 3. Add a new column named length using edge_length() function.
+net1 <- osm_1$osm_lines %>% 
+  as_sfnetwork(directed = FALSE) %>%
+  activate('edges') %>%
+  filter(!edge_is_multiple()) %>%
+  filter(!edge_is_loop()) %>%
+  convert(to_spatial_subdivision) %>%
+  convert(to_spatial_smooth) %>%
+  mutate('length' = edge_length() %>% unclass())
+
+net2 <- osm_2$osm_lines %>% 
+  as_sfnetwork(directed = FALSE) %>%
+  activate('edges') %>%
+  filter(!edge_is_multiple()) %>%
+  filter(!edge_is_loop()) %>%
+  convert(to_spatial_subdivision) %>%
+  convert(to_spatial_smooth) %>%
+  mutate('length' = edge_length() %>% unclass())
+  
+# //TASK //////////////////////////////////////////////////////////////////////
+  
+  
+# =========== NO MODIFICATION ZONE STARTS HERE ===============================
+# OSM for the walkable part
+edges_1 <- net1 %>% 
+  # Extract 'edges'
+  st_as_sf("edges") %>% 
+  # Drop redundant columns 
+  select(osm_id, highway, length) %>% 
+  # Drop segments that are too short (100m)
+  filter(length > 50) %>% 
+  # Add a unique ID for each edge
+  mutate(edge_id = seq(1,nrow(.)),
+         is_walkable = "walkable")
+
+# OSM for the unwalkable part
+edges_2 <- net2 %>% 
+  # Extract 'edges'
+  st_as_sf("edges") %>% 
+  # Drop redundant columns 
+  select(osm_id, highway, length) %>% 
+  # Drop segments that are too short (100m)
+  filter(length > 50) %>% 
+  # Add a unique ID for each edge
+  mutate(edge_id = seq(1,nrow(.)),
+         is_walkable = "unwalkable")
+
+# Merge the two
+edges <- bind_rows(edges_1, edges_2)
+# =========== NO MODIFY ZONE ENDS HERE ========================================
+```
+
+
+###  Step 2. Define a function that performs Step 3.
+```{r}
+get_azi <- function(line){
+  # This function takes one edge (i.e., a street segment) as an input and
+  # outputs a data frame with four points (start, mid1, mid2, and end) and their azimuth.
+  
+  
+  
+  # TASK ////////////////////////////////////////////////////////////////////////
+  # 1. From `line` object, extract the coordinates using st_coordinates() and extract the first two rows.
+  # 2. Use atan2() function to calculate the azimuth in degree. 
+  #    Make sure to adjust the value such that 0 is north, 90 is east, 180 is south, and 270 is west.
+  # 1
+  start_p <- line %>% 
+    st_coordinates() %>% .[1:2,]
+
+  # 2
+  start_azi <- atan2(start_p[2,"X"] - start_p[1, "X"], start_p[1,"Y"] - start_p[1,"Y"])*180/pi
+  # //TASK //////////////////////////////////////////////////////////////////////
+
+    
+    
+  
+  # TASK ////////////////////////////////////////////////////////////////////////
+  # Repeat what you did above, but for last two rows (instead of the first two rows).
+  # Remember to flip the azimuth so that the camera would be looking at the street that's being measured
+  end_p <- line %>% 
+    st_coordinates() %>% .[(nrow(.)-1):nrow(.),]
+    
+  end_azi <- atan2(end_p[2,"X"] - end_p[1, "X"], end_p[1,"Y"] - end_p[1,"Y"])*180/pi
+    
+  end_azi <- if (end_azi < 180) {end_azi + 180} else {end_azi - 180}
+  # //TASK //////////////////////////////////////////////////////////////////////
+  
+  
+  
+  
+  # TASK ////////////////////////////////////////////////////////////////////////
+  # 1. From `line` object, use st_line_sample() function to generate points at 0.45 and 0.55 locations. These two points will be used to calculate the azimuth.
+  # 2. Use st_case() function to convert 'MULTIPOINT' object to 'POINT' object.
+  # 3. Extract coordinates using st_coordinates().
+  # 4. Use atan2() functino to Calculate azimuth.
+  # 5. Use st_line_sample() again to generate a point at 0.5 location and get its coordinates. This point will be the location at which GSV image will be downloaded.
+  
+  mid_p <- line %>% 
+    st_line_sample(sample = c(0.45, 0.55)) %>%
+    st_cast("POINT") %>%
+    st_coordinates()
+  
+  mid_azi <- atan2(mid_p[2,"X"] - mid_p[1, "X"],
+                 mid_p[2,"Y"] - mid_p[1,"Y"])*180/pi
+
+ 
+    
+  
+  # =========== NO MODIFICATION ZONE STARTS HERE ===============================
+  return(tribble(
+    ~type,    ~X,            ~Y,             ~azi,
+    "start",   start_p[1,"X"], start_p[1,"Y"], start_azi,
+    "mid1",    mid_p[1,"X"],   mid_p[1,"Y"],   mid_azi,
+    "mid2",    mid_p[2,"X"],   mid_p[2,"Y"],   ifelse(mid_azi < 180, mid_azi + 180, mid_azi - 180),
+    "end",     end_p[2,"X"],   end_p[2,"Y"],   end_azi))
+  # =========== NO MODIFY ZONE ENDS HERE ========================================
+
+}
+```
+
+
+###  Step 3. Apply the function to all street segments 
+
+We can apply `get_azi()` function to the edges object. We finally append `edges` object to make use of the columns in `edges` object (e.g., `is_walkable` column). When you are finished with this code chunk, you will be ready to download GSV images. 
+
+
+
+```{r}
+# TASK ////////////////////////////////////////////////////////////////////////
+# Apply get_azi() function to all edges.
+# Remember that you need to pass edges object to st_geometry() 
+# before you apply get_azi()
+endp_azi <- edges %>% 
+  st_geometry() %>% 
+  map_df(get_azi) 
+
+# //TASK //////////////////////////////////////////////////////////////////////
+
+# =========== NO MODIFICATION ZONE STARTS HERE ===============================
+endp <- endp_azi %>% 
+  bind_cols(edges %>% 
+              st_drop_geometry() %>% 
+              slice(rep(1:nrow(edges),each=4))) %>% 
+  st_as_sf(coords = c("X", "Y"), crs = 4326, remove=FALSE) %>% 
+  mutate(node_id = seq(1, nrow(.)))
+# =========== NO MODIFY ZONE ENDS HERE ========================================
+```
+
+###  Step 4. Define a function that formats request URL and download images.
+
+```{r}
+get_image <- function(iterrow){
+  # This function takes one row of endp and downloads GSV image using the information from endp.
+  
+  # TASK ////////////////////////////////////////////////////////////////////////
+  # Finish this function definition.
+  # 1. Extract required information from the row of endp, including 
+  #    type (i.e., start, mid1, mid2, end), location, heading, edge_id, node_id, source (i.e., outdoor vs. default) and key.
+  # 2. Format the full URL and store it in furl. Refer to this page: https://developers.google.com/maps/documentation/streetview/request-streetview
+  # 3. Format the full path (including the file name) of the image being downloaded and store it in fpath
+  type = iterrow$type
+  location <- paste0(iterrow$Y %>% round(4), ",", iterrow$X %>% round(4))
+  heading <- iterrow$azi %>% round(1)
+  edge_id <- iterrow$edge_id
+  node_id <- iterrow$node_id
+  highway <- iterrow$highway
+  key <- Sys.getenv("gsv_api")
+  
+  furl <- glue::glue("https://maps.googleapis.com/maps/api/streetview?size=640x640&location={location}&heading={heading}&fov=90&pitch=0&key={key}")
+  fname <- glue::glue("GSV-nid_{node_id}-eid_{edge_id}-type_{type}-Location_{location}-heading_{heading}.jpg") # Don't change this code for fname
+  fpath <- here('Images',fname)
+  # //TASK //////////////////////////////////////////////////////////////////////
+
+  
+  
+  # =========== NO MODIFICATION ZONE STARTS HERE ===============================
+  # Download images
+  if (!file.exists(fpath)){
+    download.file(furl, fpath, mode = 'wb') 
+  }
+  # =========== NO MODIFY ZONE ENDS HERE ========================================
+}
+```
+
+###  Step 5. Download GSV images
+
+**<font color='red'> Before you download GSV images, make sure the row number of `endp` is not too large! The row number of `endp` will be the number of GSV images you will be downloading. Before you download images, always double-check your Google Cloud Console's Billing tab to make sure that you will not go above the free credit of $200 each month. The price is $7 per 1000 images. </font>**
+
+```{r, eval=FALSE}
+# =========== NO MODIFICATION ZONE STARTS HERE ===============================
+# Loop!
+for (i in seq(1,nrow(endp))){
+  get_image(endp[i,])
+}
+# =========== NO MODIFY ZONE ENDS HERE ========================================
+```
+
+###  Step 6. Apply computer vision
+
+Now, you need to upload the images you downloaded to Google Drive. You should upload the images to the same folder that we used in class - the 'demo_images' folder in the root directory of Google Drive. Then, use [Google Colab](https://colab.research.google.com/drive/1G9m85QNlMqAHNuw854qhZQTFAqetrnYG?usp=sharing) to apply a semantic segmentation model called [Pyramid Scene Parsing Network](https://openaccess.thecvf.com/content_cvpr_2017/html/Zhao_Pyramid_Scene_Parsing_CVPR_2017_paper.html). 
+
+###  Step 7. Merging the processed data back to R
+
+Once all of the images are processed and saved in your Google Drive as a CSV file, download the CSV file and merge it back to edges.
+
+```{r}
+# Read the downloaded CSV file from Google Drive
+pspnet <- read.csv("./seg_output.csv")
+
+
+
+
+# =========== NO MODIFICATION ZONE STARTS HERE ===============================
+# Join the pspnet object back to endp object using node_id as the join key.
+pspnet_nodes <- endp %>% inner_join(pspnet, by="node_id") %>% 
+  select(type, X, Y, node_id, building, sky, tree, road, sidewalk) %>% 
+  mutate(across(c(building, sky, tree, road, sidewalk), function(x) x/(640*640)))
+# =========== NO MODIFY ZONE ENDS HERE ========================================
+```
+
+# Section 3. Summarise and analyze the results.
+
+At the beginning of this assignment, you defined one Census Tract as walkable and the other as unwalkable. The key to the following analysis is the comparison between walkable/unwalkable Census Tracts.
+
+### Analysis 1 - Create map(s) to visualize the spatial distribution of the streetscape.
+You need to create maps of the proportion of building, sky, tree, road, and sidewalk for walkable and unwalkable areas. In total, you will have 10 maps (two Census Tracts times five categories). 
+
+**<font color=pink> Below the maps, provide a brief description of your findings from the maps. </font>**
+```{r}
+tmap_options(legend.outside = TRUE, 
+             legend.position = c('center', 'bottom'), 
+             legend.outside.position = 'bottom', 
+             legend.stack = 'horizontal',
+             legend.frame = FALSE,
+             title.position = c('center','top'),
+             title.size = 2)
+
+viz_facet_1 <- tmap_mode('plot') +
+  tm_shape(edges) +
+  tm_facets(by = 'is_walkable') +
+  tm_lines() +
+  tm_shape(pspnet_nodes) + 
+  tm_bubbles(col = 'sidewalk', 
+             size = 'tree', 
+             style = 'quantile', 
+             alpha = 0.8, 
+             legend.shape.is.portrait = FALSE, 
+             legend.col.is.portrait = FALSE, 
+             title.size = '% Tree', 
+             title.col = '% Sidewalk')
+
+viz_facet_2 <- tmap_mode('plot') +
+  tm_shape(edges) +
+  tm_facets(by = 'is_walkable') +
+  tm_lines() +
+  tm_shape(pspnet_nodes) + 
+  tm_bubbles(col = 'sidewalk', 
+             size = 'building', 
+             style = 'quantile', 
+             alpha = 0.8, 
+             legend.shape.is.portrait = FALSE, 
+             legend.col.is.portrait = FALSE, 
+             title.size = '% Building', 
+             title.col = '% Sidewalk')
+
+viz_facet_1
+viz_facet_2
+tmap_options_reset()
+```
+Looking at the maps, the first thing I notice is how much denser the road network is in the walkable tract. But there is a long stretch of road that has low sidewalk and tree occurrence, but does have a really high building occurrence.To me this means that there is a part of this tract that is extremely unwalkable despite having a high density of buildings. If this isn't an industrial area, perhapse the county / city would want to look into improving pedestrian infrastructure in this area. Another thing that jumps out at me is the similarity of tree density between both tracts. Though the first tract appears less walkable, there is a simlar amount of tree cover.
+
+### Analysis 2 - Compare the means.
+
+You need to calculate the mean of the proportion of building, sky, tree, road, and sidewalk for walkable and unwalkable areas. For example, you need to calculate the mean of building category for each of walkable and unwalkable Census Tracts. Then, you need to calculate the mean of sky category for each of walkable and unwalkable Census Tracts. In total, you will have 10 mean values. **<font color=pink> After the calculation, provide a brief description of your findings. </font>**
+
+```{r}
+#Get the tracts of interest so we can perform a join to get walkable and unwalkable tracts
+tract_geom <- tract %>% filter(GEOID == tr1_ID | GEOID == tr2_ID) %>%
+  mutate(walkable = case_when(
+    GEOID == tr1_ID ~ TRUE,
+    TRUE ~ FALSE
+  )) %>%
+  select(c(geometry, walkable, NAME)) %>%
+  st_transform(st_crs(pspnet_nodes)) %>%
+  st_join(pspnet_nodes, st_intersects) %>%
+  filter(!is.na(walkable)) %>%
+  select(-c(type, X, Y, node_id))
+
+
+psp_means <- tract_geom %>%
+  group_by(walkable, NAME) %>%
+  summarize(across(c(building, sky, tree, road, sidewalk), 
+                   .fn = ~ round(mean(.x),2)
+                   )
+            )
+
+psp_means %>%
+  kable()
+
+```
+Based on the table above, there seems to be no discernable difference between the proportions of building, sky, trees, and sidewalk. The only notable difference is that of road, which has about a 4% point difference between the means.
+
+### Analysis 3 - Draw boxplot 
+
+You need to calculate the mean of the proportion of building, sky, tree, road, and sidewalk for walkable and unwalkable areas. For example, you need to calculate the mean of building category for each of walkable and unwalkable Census Tracts. Then, you need to calculate the mean of sky category for each of walkable and unwalkable Census Tracts. In total, you will have 10 mean values. **<font color=pink> After the calculation, provide a brief description of your findings. </font>**
+
+```{r}
+ggplot(tract_geom %>% st_drop_geometry() %>% pivot_longer(cols = c(building, sky, tree, road, sidewalk), names_to = 'measure'), aes(x = walkable, y = value, fill = walkable)) +
+  facet_wrap(~measure) +
+  geom_violin(alpha = .8) +
+  geom_boxplot(size = .25, width = 0.25) +
+  labs(y = '% Occurence', x = 'Tract Walkability') +
+  theme(legend.position = 'none')
+
+```
+Looking at the visualizations above, it appears both the walkable and non walkable tracts share similar distributions across all walkability variables. Notably, the walkable tract has a lot of outliers in the "building %" measure. Perhaps this means that there is one area within the tract that is exceptionally walkable, and the rest of the tract isn't as much.
+
+
+

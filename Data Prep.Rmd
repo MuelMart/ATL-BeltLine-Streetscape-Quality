@@ -1,0 +1,115 @@
+---
+title: "BeltLine Terminal Prep and Analysis"
+author: "Samuel Martinez, Malavika Murali, Yuxiang Zhao"
+date: "2022-11-16"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r, Load Packages}
+library(tidyverse)
+library(tidycensus)
+library(sf)
+library(tmap)
+library(reticulate)
+library(units)
+library(osmdata)
+library(sfnetworks)
+
+#Set tmap options
+tmap_options(basemaps = "https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png",
+             main.title.size = 0.8,
+             main.title.fontface = 'bold')
+```
+
+## **An Analysis of the Quality of Atlanta BeltLine Terminals**
+
+  This project performs an analysis of images from Google Street View, with the aim of evaluating the quality of streetscapes in and around the Atlanta BeltLine. Through this methodology, we set out to contextualize the following question: which access points (and areas around access points) to the BeltLine exhibit a poor degree of walkability and pedestrian oriented design. In order to perform this analysis, we identify a series of points around each of the major access points to the BeltLine. This process was done manually in ArcGIS. Each of these points represents a Google Street View image of the road corridor. Then, using the PSPNET Computer Vision model, we identify and calculate the various metrics that determine the quality of the streetscape (outlined in section XX). Across each series of images (aggregated across each BeltLine access point), we aggregate the calculated metrics and determine a final streetscape "score" for each sector. Once the analysis is complete, we will plot on a map each of the access points alongside their calculated scores. The goal of this study is to provide a spatial analysis of which parts of the BeltLine need enhanced pedestrian infrastructure, in order to ameliorate heightened injury risk at the points of access.
+  
+### **Section 1: Analysis of Data**
+
+  Here, we load in the access point data and plot the distribution of access points in space.
+  
+  YUXIANG ENTER METHODOLOGY BELOW:
+  
+```{r, Read in Access Point Data}
+#All geographic analysis will use the NAD83 / Georgia West Projected Coordinate System
+epsg_id <- 26967
+
+#Read in raw dataframe of coordinate points
+ap_raw <- read_csv('./data/beltline dots.csv')
+
+#Convert the spreadsheet to an SF object
+ap  <- ap_raw %>%
+  st_as_sf(coords = c('latitude', 'longitude'), crs = 4326) %>%
+  st_transform(epsg_id)
+
+#Read in Atlanta BeltLine Shapefile
+beltline <- st_read('./data/BeltLine_Trails.shp') %>%
+  st_transform(epsg_id)
+
+#Plot accesspoints relative to BeltLine
+tmap_mode('view')
+
+tm_shape(beltline) +
+  tm_lines(lwd = 2, col = '#00820d', lty = 'dashed') +
+  tm_shape(ap) +
+  tm_dots(alpha = 0.75)
+```
+
+The next order of business is to load in OSM Street Networks, so that we can identify the surrounding streets of the BeltLine for which we will collect images.
+
+```{r, Get OSM Street Segments}
+#Establish a buffer length for analysis
+buffer <- set_units(20, 'meters')
+
+#Set bounding box of the search area
+bl_bbox <- st_bbox(beltline %>% 
+                     st_buffer(dist = set_units(1, 'mile')) %>% 
+                     st_transform(crs = 4326))
+  
+
+#Read in OSM street data for streets within the bounding box
+osm_raw <- opq(bbox = bl_bbox) %>%
+  add_osm_feature(key = 'highway', value = c('motorway', 'trunk', 'primary', 'secondary', 'tertiary', 'unclassified','residential')) %>%
+  osmdata_sf() %>%
+  osm_poly2line()
+
+osm_streets <- osm_raw$osm_lines %>%
+  st_transform(epsg_id)
+
+#Plot road networks
+tmap_mode('plot')
+
+tm_shape(osm_streets) +
+  tm_lines() +
+  tm_shape(beltline) +
+  tm_lines(col = 'red', lwd = 2) +
+  tm_layout(main.title = 'BeltLine and Surrounding Streets')
+
+#Now clean the road networks to just those that intersect with the access points
+street_segments <- osm_streets %>%
+  select(c(highway, geometry)) %>%
+  st_filter(ap %>% st_buffer(buffer), .predicate = st_intersects)
+
+tmap_mode('plot')
+tm_shape(street_segments) +
+  tm_lines() +
+  tm_shape(beltline) +
+  tm_lines(col = 'red', lwd = 2) +
+  tm_shape(ap) +
+  tm_dots(size = .05) +
+  tm_layout(main.title = 'BeltLine Access Point Streets')
+```
+
+Now, we establish the nodes on the street for which we will capture images.
+
+```{r, Get Street Nodes}
+#Get the street segments that are attached to each access point, then determine the beginning and end of those line segments
+ap_segments <- street_segments %>%
+  st_join(ap %>% st_buffer(buffer), st_intersects)
+
+```
