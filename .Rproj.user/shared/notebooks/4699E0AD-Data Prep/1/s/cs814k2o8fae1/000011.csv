@@ -1,7 +1,0 @@
-"0","#Get the street segments that are attached to each access point
-ap_segments <- street_segments %>%
-  st_join(ap %>% st_buffer(buffer), st_intersects) %>%
-  sf_poly2line()
-"
-"2","Error in sf_poly2line(.) : could not find function ""sf_poly2line""
-"

@@ -18,6 +18,7 @@ library(reticulate)
 library(units)
 library(osmdata)
 library(sfnetworks)
+library(tidygraph)
 
 #Set tmap options
 tmap_options(basemaps = "https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png",
@@ -40,7 +41,7 @@ tmap_options(basemaps = "https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png",
 epsg_id <- 26967
 
 #Read in raw dataframe of coordinate points
-ap_raw <- read_csv('./data/beltline dots.csv')
+ap_raw <- read_csv('./data/beltline_points.csv')
 
 #Convert the spreadsheet to an SF object
 ap  <- ap_raw %>%
@@ -78,22 +79,39 @@ osm_raw <- opq(bbox = bl_bbox) %>%
   osmdata_sf() %>%
   osm_poly2line()
 
+#Get the street SF object
 osm_streets <- osm_raw$osm_lines %>%
-  st_transform(epsg_id)
+  st_transform(epsg_id) %>%
+  filter(!is.na(osm_id))
+
+#Convert to SF Network, and clean the edges
+street_net <- osm_streets %>%
+  as_sfnetwork(directed = FALSE)
+
+street_edges <- street_net %>%
+  activate('edges') %>%
+  mutate('length' = edge_length()) %>%
+  filter(!edge_is_multiple()) %>%
+  filter(!edge_is_loop()) %>%
+  convert(to_spatial_subdivision) %>%
+  convert(to_spatial_smooth) %>%
+  mutate('length' = edge_length() %>% unclass()) %>%
+  st_as_sf()
 
 #Plot road networks
-tmap_mode('plot')
+tmap_mode('view')
 
-tm_shape(osm_streets) +
+tm_shape(street_edges) +
   tm_lines() +
   tm_shape(beltline) +
   tm_lines(col = 'red', lwd = 2) +
   tm_layout(main.title = 'BeltLine and Surrounding Streets')
 
 #Now clean the road networks to just those that intersect with the access points
-street_segments <- osm_streets %>%
-  select(c(highway, geometry)) %>%
-  st_filter(ap %>% st_buffer(buffer), .predicate = st_intersects)
+street_segments <- street_edges %>%
+  select(c(osm_id, geometry)) %>%
+  st_join(ap %>% st_buffer(buffer), st_intersects) %>%
+  filter(!is.na(OBJECTID))
 
 tmap_mode('plot')
 tm_shape(street_segments) +
@@ -105,11 +123,131 @@ tm_shape(street_segments) +
   tm_layout(main.title = 'BeltLine Access Point Streets')
 ```
 
-Now, we establish the nodes on the street for which we will capture images.
+Next, we divide each street segment into points at each 10 m interval on said street segment. After, we create a lookup table of nearest access point geometries that correspond to each road point.
 
-```{r, Get Street Nodes}
-#Get the street segments that are attached to each access point, then determine the beginning and end of those line segments
-ap_segments <- street_segments %>%
-  st_join(ap %>% st_buffer(buffer), st_intersects)
+```{r, Create Road Point-Access Point Lookup Tables}
+#Now we want the points on each street segment that are closest to the beltline.
+street_points <- street_segments %>%
+  
+  #Breakup lines into segments
+  st_line_sample(density = 1/10) %>%
+  st_as_sf() %>%
+  
+  #Convert to points
+  st_cast(to = "POINT") %>%
+  
+  #Reappend OSM IDs
+  st_join(street_segments %>% st_buffer(set_units(1,'meter')), st_intersects) %>%
+  
+  st_transform(epsg_id)
 
+#Now we need to get the access point geometry that corresponds to each street segment
+street_nearest_ap <- street_points %>%
+  st_drop_geometry() %>%
+  left_join(ap, by = 'OBJECTID') %>%
+  st_as_sf() %>%
+  st_transform(epsg_id)
+```
+
+This chunk uses the lookup tables above to slice the 3 closest road points to each corresponding access point.
+These points will be the locations for the Google Street View image queries.
+
+```{r, Identify 3 Closest Points to BeltLine Access Point}
+
+ap_closest <- street_points %>%
+  #Create a line geometry of each road point to its corresponding access point.
+  st_nearest_points(street_nearest_ap, pairwise = TRUE) %>%
+  st_as_sf() %>%
+  
+  #Calculate the distance of each road point to the access point
+  mutate(length = st_length(.) %>% unclass()) %>%
+  st_drop_geometry() %>%
+  bind_cols(street_points) %>%
+  
+  #Find the 3 closest points to each access point
+  group_by(OBJECTID) %>%
+  arrange(length) %>%
+  slice(1:3) %>%
+  st_as_sf(crs = epsg_id)
+```
+
+Here we create helper functions to calculate the Azimuth (angle of the camera) and convert the road point coordinates to WGS 1984.
+
+```{r, Geometric Functions}
+#Function for getting the azimuth towards the beltline
+get_azi <- function(point, o_id, unit = 10){
+  
+  #Get the beltline access point
+  b <- ap %>%
+    filter(o_id == OBJECTID)
+  
+  #Get a point x meters down from the beltline
+  a <- point
+  
+  #Calculate the azimuth and return it
+  y1 <- a %>% st_coordinates() %>% .[,'Y']
+  y2 <- b %>% st_coordinates() %>% .[,'Y']
+  x1 <- a %>% st_coordinates() %>% .[,'X']
+  x2 <- b %>% st_coordinates() %>% .[,'X']
+  azi <- atan2(y1 - y2, x1 - x2) * (180/pi)
+  
+  return(azi)
+}
+
+#Vectorize the azimuth function
+get_azi_V <- Vectorize(get_azi)
+
+#Function for getting the coordinates for imagery
+get_gsv_coord <- function(point, unit = 10, epsg = 4326){
+  
+  pt <- point %>%
+    st_transform(crs = epsg) %>%
+    st_coordinates()
+  
+  coords <- paste0(pt[,'Y'] %>% round(4), ',', pt[,'X'] %>% round(4))
+  
+  return(coords)
+}
+```
+
+Here we craft the URLs for each road point.
+```{r, Prep Data for GSV Imagery}
+key <- Sys.getenv('gsv_api')
+fpath <- './image exports/'
+
+gsv_prepped <- ap_closest %>%
+  #Append the azimuth for the closest point to the beltline access point
+  mutate(azi = get_azi_V(point = `geometry`, o_id = `OBJECTID`, unit = 10) %>% round(1)) %>%
+  
+  #Prep the coordinates for the API call
+  mutate(coord = get_gsv_coord(geometry)) %>%
+  
+  #Craft URL
+  mutate(furl = glue::glue("https://maps.googleapis.com/maps/api/streetview?size=640x640&location={coord}&heading={azi}&fov=90&pitch=0&key={key}")) %>%
+  
+  mutate(path = paste0('./image exports/', paste0(`OBJECTID`,'_',str_replace(`coord`,',','_')), '.jpg'))
+
+node_key <- gsv_prepped %>%
+  st_drop_geometry() %>%
+  count(path) %>%
+  mutate(node_id = row_number()) %>%
+  select(-c(n, path)) %>%
+  ungroup()
+```
+
+Now we read in each image.
+```{r, Query GSV Imagery, eval = FALSE, message = FALSE}
+for (i in 1:nrow(gsv_prepped)){
+  obs <- gsv_prepped[i,]
+  if(!file.exists(obs$path)){
+    download.file(obs$furl, obs$path, mode = 'wb')
+  }
+}
+```
+
+```{r, Normalize Imagery Output}
+imagery_raw <- read_csv('./data/seg_output.csv') 
+
+imagery <- imagery_raw %>%
+  left_join(node_key, by = 'node_id')
 ```
