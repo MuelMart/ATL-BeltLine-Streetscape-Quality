@@ -2,7 +2,9 @@
 title: "BeltLine Terminal Prep and Analysis"
 author: "Samuel Martinez, Malavika Murali, Yuxiang Zhao"
 date: "2022-11-16"
-output: html_document
+output:
+  pdf_document: default
+  html_document: default
 ---
 
 ```{r setup, include=FALSE}
@@ -19,7 +21,7 @@ library(units)
 library(osmdata)
 library(sfnetworks)
 library(tidygraph)
-
+webshot::install_phantomjs()
 #Set tmap options
 tmap_options(basemaps = "https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png",
              main.title.size = 0.8,

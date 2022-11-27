@@ -40,6 +40,9 @@ Attaching package: ‘tidygraph’
     filter
 
 "
+"0","webshot::install_phantomjs()"
+"2","It seems that the version of `phantomjs` installed is greater than or equal to the requested version.To install the requested version or downgrade to another version, use `force = TRUE`.
+"
 "0","#Set tmap options"
 "0","tmap_options(basemaps = ""https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png"","
 "0","             main.title.size = 0.8,"
