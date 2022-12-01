@@ -1,0 +1,320 @@
+---
+title: "BeltLine Terminal Prep and Analysis"
+author: "Samuel Martinez, Malavika Murali, Yuxiang Zhao"
+date: "2022-11-16"
+output:
+  html_document: default
+  pdf_document: default
+  pandoc_args: ["+RTS", "-M1024M", "-RTS"]
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r, Load Packages}
+library(tidyverse)
+library(tidycensus)
+library(sf)
+library(tmap)
+library(reticulate)
+library(units)
+library(osmdata)
+library(sfnetworks)
+library(tidygraph)
+library(wordcloud2)
+
+#Set tmap options
+tmap_options(basemaps = "https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png",
+             main.title.size = 0.8,
+             main.title.fontface = 'bold')
+```
+
+## **An Analysis of the Quality of Atlanta BeltLine Terminals**
+
+This project performs an analysis of images from Google Street View, with the aim of evaluating the quality of streetscapes in and around the Atlanta BeltLine. Through this methodology, we set out to contextualize the following question: which access points (and areas around access points) to the BeltLine exhibit a poor degree of walkability and pedestrian oriented design. In order to perform this analysis, we identify a series of points around each of the major access points to the BeltLine. This process was done manually in ArcGIS. Each of these points represents a Google Street View image of the road corridor. Then, using the PSPNET Computer Vision model, we identify and calculate the various metrics that determine the quality of the streetscape (outlined in section XX). Across each series of images (aggregated across each BeltLine access point), we aggregate the calculated metrics and determine a final streetscape "score" for each sector. Once the analysis is complete, we will plot on a map each of the access points alongside their calculated scores. The goal of this study is to provide a spatial analysis of which parts of the BeltLine need enhanced pedestrian infrastructure, in order to ameliorate heightened injury risk at the points of access.
+
+### **Section 1: Data Prep**
+
+Here, we load in the access point data and plot the distribution of access points in space.
+
+```{r, Read in Access Point Data}
+#All geographic analysis will use the NAD83 / Georgia West Projected Coordinate System
+epsg_id <- 26967
+
+#Read in raw dataframe of coordinate points
+ap_raw <- read_csv('./data/beltline_points.csv')
+
+#Convert the spreadsheet to an SF object
+ap  <- ap_raw %>%
+  st_as_sf(coords = c('latitude', 'longitude'), crs = 4326) %>%
+  st_transform(epsg_id)
+
+#Read in Atlanta BeltLine Shapefile
+beltline <- st_read('./data/BeltLine_Trails.shp') %>%
+  st_transform(epsg_id)
+
+#Plot accesspoints relative to BeltLine
+tmap_mode('view')
+
+tm_shape(beltline) +
+  tm_lines(lwd = 2, col = '#00820d', lty = 'dashed') +
+  tm_shape(ap) +
+  tm_dots(alpha = 0.75)
+```
+
+The next order of business is to load in OSM Street Networks, so that we can identify the surrounding streets of the BeltLine for which we will collect images.
+
+```{r, Get OSM Street Segments}
+#Establish a buffer length for analysis
+buffer <- set_units(20, 'meters')
+
+#Set bounding box of the search area
+bl_bbox <- st_bbox(beltline %>% 
+                     st_buffer(dist = set_units(1, 'mile')) %>% 
+                     st_transform(crs = 4326))
+  
+
+#Read in OSM street data for streets within the bounding box
+osm_raw <- opq(bbox = bl_bbox) %>%
+  add_osm_feature(key = 'highway', value = c('motorway', 'trunk', 'primary', 'secondary', 'tertiary', 'unclassified','residential')) %>%
+  osmdata_sf() %>%
+  osm_poly2line()
+
+#Get the street SF object
+osm_streets <- osm_raw$osm_lines %>%
+  st_transform(epsg_id) %>%
+  filter(!is.na(osm_id))
+
+#Convert to SF Network, and clean the edges
+street_net <- osm_streets %>%
+  as_sfnetwork(directed = FALSE)
+
+street_edges <- street_net %>%
+  activate('edges') %>%
+  mutate('length' = edge_length()) %>%
+  filter(!edge_is_multiple()) %>%
+  filter(!edge_is_loop()) %>%
+  convert(to_spatial_subdivision) %>%
+  convert(to_spatial_smooth) %>%
+  mutate('length' = edge_length() %>% unclass()) %>%
+  st_as_sf()
+
+#Plot road networks
+tmap_mode('view')
+
+tm_shape(street_edges) +
+  tm_lines() +
+  tm_shape(beltline) +
+  tm_lines(col = 'red', lwd = 2) +
+  tm_layout(main.title = 'BeltLine and Surrounding Streets')
+
+#Now clean the road networks to just those that intersect with the access points
+street_segments <- street_edges %>%
+  select(c(osm_id, geometry)) %>%
+  st_join(ap %>% st_buffer(buffer), st_intersects) %>%
+  filter(!is.na(OBJECTID))
+
+tmap_mode('view')
+tm_shape(street_segments) +
+  tm_lines(lwd = 1.25) +
+  tm_shape(beltline) +
+  tm_lines(col = 'red', lwd = 2) +
+  tm_shape(ap) +
+  tm_dots(size = .05) +
+  tm_layout(main.title = 'BeltLine Access Point Streets')
+```
+
+Next, we divide each street segment into points at each 10 m interval on said street segment. After, we create a lookup table of nearest access point geometries that correspond to each road point.
+
+```{r, Create Road Point-Access Point Lookup Tables}
+#Now we want the points on each street segment that are closest to the beltline.
+street_points <- street_segments %>%
+  
+  #Breakup lines into segments
+  st_line_sample(density = 1/10) %>%
+  st_as_sf() %>%
+  
+  #Convert to points
+  st_cast(to = "POINT") %>%
+  
+  #Reappend OSM IDs
+  st_join(street_segments %>% st_buffer(set_units(1,'meter')), st_intersects) %>%
+  
+  st_transform(epsg_id)
+
+#Now we need to get the access point geometry that corresponds to each street segment
+street_nearest_ap <- street_points %>%
+  st_drop_geometry() %>%
+  left_join(ap, by = 'OBJECTID') %>%
+  st_as_sf() %>%
+  st_transform(epsg_id)
+```
+
+This chunk uses the lookup tables above to slice the 3 closest road points to each corresponding access point. These points will be the locations for the Google Street View image queries.
+
+```{r, Identify 3 Closest Points to BeltLine Access Point}
+
+ap_closest <- street_points %>%
+  #Create a line geometry of each road point to its corresponding access point.
+  st_nearest_points(street_nearest_ap, pairwise = TRUE) %>%
+  st_as_sf() %>%
+  
+  #Calculate the distance of each road point to the access point
+  mutate(length = st_length(.) %>% unclass()) %>%
+  st_drop_geometry() %>%
+  bind_cols(street_points) %>%
+  
+  #Find the 3 closest points to each access point
+  group_by(OBJECTID) %>%
+  arrange(length) %>%
+  slice(1:3) %>%
+  st_as_sf(crs = epsg_id)
+
+tmap_mode('view')
+tm_shape(street_segments) +
+  tm_lines() +
+  tm_shape(beltline) +
+  tm_lines(col = 'red', lwd = 2) +
+  tm_shape(ap) +
+  tm_dots(size = .075, col = 'blue') +
+  tm_shape(ap_closest) +
+  tm_dots(size = .05, col = 'green') +
+  tm_layout(main.title = 'BeltLine Access Point Streets')
+```
+
+Here we create helper functions to calculate the Azimuth (angle of the camera) and convert the road point coordinates to WGS 1984.
+
+```{r, Geometric Functions}
+#Function for getting the azimuth towards the beltline
+get_azi <- function(point, o_id, unit = 10){
+  
+  #Get the beltline access point
+  b <- ap %>%
+    filter(o_id == OBJECTID)
+  
+  #Get a point x meters down from the beltline
+  a <- point
+  
+  #Calculate the azimuth and return it
+  y1 <- a %>% st_coordinates() %>% .[,'Y']
+  y2 <- b %>% st_coordinates() %>% .[,'Y']
+  x1 <- a %>% st_coordinates() %>% .[,'X']
+  x2 <- b %>% st_coordinates() %>% .[,'X']
+  azi <- atan2(y1 - y2, x1 - x2) * (180/pi)
+  
+  return(azi)
+}
+
+#Vectorize the azimuth function
+get_azi_V <- Vectorize(get_azi)
+
+#Function for getting the coordinates for imagery
+get_gsv_coord <- function(point, unit = 10, epsg = 4326){
+  
+  pt <- point %>%
+    st_transform(crs = epsg) %>%
+    st_coordinates()
+  
+  coords <- paste0(pt[,'Y'] %>% round(4), ',', pt[,'X'] %>% round(4))
+  
+  return(coords)
+}
+```
+
+Here we craft the URLs for each road point.
+
+```{r, Prep Data for GSV Imagery}
+key <- Sys.getenv('gsv_api')
+fpath <- './image exports/'
+
+gsv_prepped <- ap_closest %>%
+  #Append the azimuth for the closest point to the beltline access point
+  mutate(azi = get_azi_V(point = `geometry`, o_id = `OBJECTID`, unit = 10) %>% round(1)) %>%
+  
+  #Prep the coordinates for the API call
+  mutate(coord = get_gsv_coord(geometry)) %>%
+  ungroup() %>%
+  mutate(node_id = row_number()) %>%
+  
+  
+  #Craft URL
+  mutate(furl = glue::glue("https://maps.googleapis.com/maps/api/streetview?size=640x640&location={coord}&heading={azi}&fov=90&pitch=0&key={key}")) %>%
+  
+  mutate(path = glue::glue("./image exports/GSV-nid_{node_id}-Location_{coord}-heading_{azi}.jpg"))
+
+node_key <- gsv_prepped %>%
+  st_drop_geometry() %>%
+  count(path) %>%
+  ungroup() %>%
+  mutate(node_id = row_number()) %>%
+  select(-c(n, path)) %>%
+  ungroup()
+
+remove(key)
+```
+
+### **Section 2: Query and Analyze Imagery**
+
+Now we read in each image.
+
+```{r, Query GSV Imagery, eval = FALSE, message = FALSE}
+for (i in 1:nrow(gsv_prepped)){
+  obs <- gsv_prepped[i,]
+  if(!file.exists(obs$path)){
+    download.file(obs$furl, obs$path, mode = 'wb')
+  }
+}
+```
+
+Read in PSPNet output and merge it with original data.
+
+```{r, Normalize Imagery Output}
+#Read in PSPNet output
+imagery_raw <- read_csv('./data/seg_output.csv')
+
+#Join with original data and normalize each field as a percentage of pixels
+imagery <- imagery_raw %>%
+  left_join(gsv_prepped %>% select(c(node_id, osm_id, OBJECTID)), by = 'node_id') %>%
+  mutate(
+    across(-c(node_id, OBJECTID, osm_id, geometry), ~ .x/(640^2))
+    ) %>%
+  st_drop_geometry() %>%
+  select(-geometry) %>%
+  
+  #Join geometry
+  left_join(ap, by = 'OBJECTID') %>%
+  st_as_sf(crs = epsg_id)
+
+#Remove key as it is no longer needed
+remove(gsv_prepped)
+
+#Write output
+write_csv(imagery %>% st_drop_geometry(), './data/PSPNet_Output.csv')
+st_write(imagery, './data/PSPNet_Output.shp', append = FALSE)
+```
+
+```{r, Plot}
+imagery_long <- imagery %>%
+  st_drop_geometry() %>%
+  mutate(
+    across(-c(node_id, OBJECTID, osm_id), ~ .x*(640^2))
+    ) %>%
+  pivot_longer(cols = -c(node_id, OBJECTID, osm_id), names_to = 'object') %>%
+  filter(value > 0)
+
+words <- imagery_long %>%
+  group_by(object) %>%
+  summarize(freq = log(sum(value)))
+
+ggplot(imagery_long, aes(x = reorder(object,-value), y = value)) +
+  geom_bar(stat = 'identity', fill = 'lightblue') +
+  labs(x = 'Object', y = '# of Pixels', title = 'What Does the Computer See?') +
+  ggdark::dark_mode() +
+  theme(axis.text.x = element_text(angle = -90, size = 7), title = element_text(face = 'bold'))
+
+wordcloud2(words, size = .45, color = 'random-light', background = 'black')
+
+
+```
+
